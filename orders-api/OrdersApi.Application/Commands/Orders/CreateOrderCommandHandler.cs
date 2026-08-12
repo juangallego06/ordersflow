@@ -1,6 +1,7 @@
 ﻿using MediatR;
 using OrdersApi.Application.DTOs;
 using OrdersApi.Application.Events;
+using OrdersApi.Application.Interfaces;
 using OrdersApi.Application.Interfaces.Repositories;
 using OrdersApi.Application.Mappings;
 using OrdersApi.Application.Models;

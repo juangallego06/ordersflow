@@ -16,8 +16,4 @@
     <ProjectReference Include="..\OrdersApi.Domain\OrdersApi.Domain.csproj" />
   </ItemGroup>
 
-  <ItemGroup>
-    <Folder Include="Common\" />
-  </ItemGroup>
-
 </Project>

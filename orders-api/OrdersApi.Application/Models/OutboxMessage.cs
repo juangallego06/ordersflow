@@ -5,7 +5,7 @@ public class OutboxMessage
     public Guid Id { get; private set; }
     public string EventType { get; private set; }
     public string Payload { get; private set; }
-    public DateTime OcurredOn { get; private set; }
+    public DateTime OccurredOn { get; private set; }
     public DateTime? ProcessedOn { get; private set; }
 
     // Constructor privado sin parámetros: necesario para EF Core.
@@ -16,7 +16,7 @@ public class OutboxMessage
         Id = Guid.NewGuid();
         EventType = eventType;
         Payload = payload;
-        OcurredOn = DateTime.UtcNow;
+        OccurredOn = DateTime.UtcNow;
         ProcessedOn = null;
     }
 
