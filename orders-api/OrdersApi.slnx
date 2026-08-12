@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="OrdersApi.Api/OrdersApi.Api.csproj" />
+  <Project Path="OrdersApi.Application/OrdersApi.Application.csproj" />
+  <Project Path="OrdersApi.Domain/OrdersApi.Domain.csproj" />
+  <Project Path="OrdersApi.Infrastructure/OrdersApi.Infrastructure.csproj" />
+</Solution>
