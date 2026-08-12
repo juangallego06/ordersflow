@@ -4,7 +4,7 @@ namespace OrdersApi.Application.Interfaces.Repositories;
 
 public interface IOutboxRepository
 {
-    Task AddSync(OutboxMessage message);
+    Task AddAsync(OutboxMessage message);
 
     Task<IEnumerable<OutboxMessage>> GetPendingMessagesAsync();
 
