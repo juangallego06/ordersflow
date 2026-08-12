@@ -35,6 +35,13 @@ BEGIN
   );
 END
 
+IF OBJECT_ID('dbo.Products', 'U') IS NULL
+BEGIN
+  CREATE TABLE Products(
+    Sku NVARCHAR(50) NOT NULL PRIMARY KEY
+  );
+END
+
 GO
 
 IF OBJECT_ID('dbo.OutboxMessages', 'U') IS NULL
@@ -46,6 +53,26 @@ BEGIN
     OccurredOn DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
     ProcessedOn DATETIME2 NULL
   );
+END
+
+GO
+
+IF NOT EXISTS (SELECT 1 FROM Products)
+BEGIN
+    INSERT INTO Products (Sku) VALUES
+        ('ABC-01'),
+        ('ABC-02'),
+        ('ABC-03');
+END
+
+GO
+
+USE InventoryDb
+
+GO
+
+IF OBJECT_ID('dbo.Stock', 'U') IS NULL
+BEGIN
 END
 
 GO
