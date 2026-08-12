@@ -1,0 +1,99 @@
+USE [master]
+
+GO
+
+IF DB_ID('OrdersDb') IS NULL
+BEGIN
+  CREATE DATABASE OrdersDb;
+END
+
+GO
+
+IF DB_ID('InventoryDb') IS NULL
+BEGIN
+  CREATE DATABASE InventoryDb;
+END
+
+GO
+
+USE OrdersDb
+
+GO
+
+IF OBJECT_ID('dbo.Orders', 'U') IS NULL
+BEGIN
+  CREATE TABLE Orders(
+    Id INT PRIMARY KEY NOT NULL IDENTITY(1,1),
+    OrderId NVARCHAR(50) NOT NULL UNIQUE,
+    CustomerName NVARCHAR(150) NOT NULL,
+    Sku NVARCHAR(50) NOT NULL,
+    Quantity INT NOT NULL
+      CONSTRAINT CK_Orders_Quantity CHECK (Quantity BETWEEN 1 AND 100),
+    OrderStatus NVARCHAR(20) NOT NULL
+      CONSTRAINT CK_Orders_Status CHECK (OrderStatus IN ('Pending', 'Confirmed', 'Rejected')),
+    CreatedAt DATETIME2 NOT NULL DEFAULT SYSDATETIME()
+  );
+END
+
+GO
+
+IF OBJECT_ID('dbo.OutboxMessages', 'U') IS NULL
+BEGIN
+  CREATE TABLE OutboxMessages(
+    Id UNIQUEIDENTIFIER NOT NULL PRIMARY KEY DEFAULT NEWID(),
+    EventType NVARCHAR(100) NOT NULL,
+    Payload NVARCHAR(MAX) NOT NULL,
+    OccurredOn DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    ProcessedOn DATETIME2 NULL
+  );
+END
+
+GO
+
+USE InventoryDb
+
+GO
+
+IF OBJECT_ID('dbo.Stock', 'U') IS NULL
+BEGIN
+  CREATE TABLE Stock(
+    Sku NVARCHAR(50) NOT NULL PRIMARY KEY,
+    Available INT NOT NULL
+      CONSTRAINT CK_Stock_Disponible CHECK (Available >= 0)
+  );
+END
+
+GO
+
+IF OBJECT_ID('dbo.ProcessedEvents', 'U') IS NULL
+BEGIN
+  CREATE TABLE ProcessedEvents(
+    EventId UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
+    ProcessedAt DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+  );
+END
+
+GO
+
+IF OBJECT_ID('dbo.OutboxMessages', 'U') IS NULL
+BEGIN
+  CREATE TABLE OutboxMessages(
+    Id UNIQUEIDENTIFIER NOT NULL PRIMARY KEY DEFAULT NEWID(),
+    EventType NVARCHAR(100) NOT NULL,
+    Payload NVARCHAR(MAX) NOT NULL,
+    OccurredOn DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    ProcessedOn DATETIME2 NULL
+  );
+END
+
+GO
+
+IF NOT EXISTS (SELECT 1 FROM Stock)
+BEGIN
+    INSERT INTO Stock (Sku, Available) VALUES
+        ('ABC-01', 100),
+        ('ABC-02', 50),
+        ('ABC-03', 25);
+END
+
+GO

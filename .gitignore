@@ -1,0 +1,17 @@
+.env
+bin/
+obj/
+.vs/
+.vscode/
+packages/
+*.nupkg
+*.snupkg
+.nuget/
+*.log
+publish/
+wwwroot/
+node_modules/
+dist/
+.angular/
+out-tsc/
+.cache/
