@@ -166,9 +166,9 @@ procesado si la publicación tuvo éxito. Si RabbitMQ está caído en ese
 momento, la publicación simplemente se reintenta en la siguiente vuelta del
 loop — el pedido ya quedó guardado de forma segura, y el evento se
 recupera solo en cuanto el broker vuelve a estar disponible. Este mismo
-servicio corre en Orders API para publicar `OrderCreated`, y se construirá
-una versión equivalente en Inventory Worker para publicar
-`StockReserved`/`StockRejected`.
+servicio corre en Orders API para publicar `OrderCreated`, y una versión
+equivalente corre en Inventory Worker para publicar
+`StockReserved`/`StockRejected` (ver "Arquitectura de Inventory Worker").
 
 ### Topología de RabbitMQ
 
@@ -215,15 +215,66 @@ respuestas HTTP: `ArgumentException` se convierte en `400`,
 controlada en `500` — así ningún controller ni handler necesita bloques
 `try/catch` propios.
 
+## Arquitectura de Inventory Worker
+
+A diferencia de Orders API, Inventory Worker no expone ninguna API — es un
+proceso que solo reacciona a un evento y responde con otro. Por eso se
+construyó como un único proyecto (`InventoryWorker`), organizado en las
+mismas capas conceptuales que Orders API (`Domain`, `Application`,
+`Infrastructure`) pero como carpetas dentro de un solo `.csproj`, no como
+proyectos separados (ver justificación en "Arquitectura de Orders API").
+
+### El flujo de `order-created`, paso a paso
+
+`OrderCreatedConsumerBackgroundService` consume la cola `order-created` con
+ack manual (`autoAck: false`), y por cada mensaje ejecuta tres pasos dentro
+de una única transacción explícita:
+
+1. **Idempotencia primero:** `IProcessedEventRepository.TryMarkAsProcessedAsync(eventId)` intenta insertar el `EventId` del evento en `ProcessedEvents`. Si ya existía (evento duplicado), no se hace nada más — se revierte la transacción y se hace `ack` del mensaje sin reprocesar.
+2. **Reserva de stock:** si es la primera vez que se ve el evento, `IStockRepository.TryReserveAsync(sku, cantidad)` ejecuta el `UPDATE` condicional descrito en la sección de `Stock` y devuelve si alcanzó el stock o no.
+3. **Outbox:** con ese resultado ya se sabe qué publicar — se arma un `OutboxMessage` con `EventType = "StockReserved"` o `"StockRejected"` y el mismo shape de datos del evento original más un `eventId` nuevo (es un evento distinto, aunque esté correlacionado por `orderId`), guardado vía `IOutboxRepository.AddAsync`.
+
+Solo si los tres pasos terminan bien se hace `CommitAsync()` de la
+transacción; cualquier excepción no controlada dispara `RollbackAsync()` y
+el mensaje se reintenta con `nack(requeue: true)`.
+
+### Por qué `IUnitOfWork` no es igual en los dos servicios
+
+Esto es una decisión intencional, no una inconsistencia entre servicios. En
+Orders API, `IUnitOfWork` es solo un envoltorio de `SaveChangesAsync()`:
+el caso de uso decide todo antes de tocar la base (crear el pedido, armar
+el mensaje del Outbox) y confirma una sola vez al final — no hay ninguna
+rama de código cuya decisión dependa de un resultado que solo la base de
+datos puede dar.
+
+En Inventory Worker sí existe esa dependencia: si el stock alcanza o no
+determina literalmente qué evento se publica. Por eso ahí `IUnitOfWork`
+expone `BeginTransactionAsync()`/`CommitAsync()`/`RollbackAsync()` en vez
+de un solo método — permite ejecutar cada paso, leer su resultado
+inmediato (filas afectadas, excepción de clave duplicada) y decidir el
+siguiente paso, todo sin que nada quede confirmado de forma permanente
+hasta el final. SQL Server lo permite de forma nativa: los `UPDATE`/
+`INSERT` intermedios son visibles para la aplicación en cuanto se
+ejecutan, aunque la transacción que los contiene siga abierta.
+
+### Publicación simétrica
+
+`OutboxPublisherBackgroundService` en Inventory Worker es la contraparte
+exacta del que corre en Orders API: revisa `OutboxMessages` cada 5
+segundos y publica lo pendiente, con la diferencia de que aquí siempre
+publica a una sola cola fija (`stock-events`). El mecanismo de
+recuperación ante caídas de RabbitMQ es idéntico al ya descrito en la
+sección de Outbox.
+
 ## Requisitos y despliegue
 
-> Esta sección se irá ampliando a medida que se agreguen los demás
-> servicios (Inventory Worker, frontend).
+> Esta sección se irá ampliando cuando se agregue el frontend.
 
 **Requisitos previos:**
 
 - Docker Desktop instalado y corriendo.
-- .NET 9 SDK (para correr Orders API en desarrollo local).
+- .NET 9 SDK (para correr Orders API e Inventory Worker en desarrollo
+  local).
 
 **Configuración:**
 
@@ -264,6 +315,28 @@ dotnet run
 El navegador abre automáticamente en `/swagger`, desde donde se pueden
 probar los tres endpoints (`POST /orders`, `GET /orders`,
 `GET /orders/{id}`).
+
+**Corriendo Inventory Worker en desarrollo local:**
+
+Igual que Orders API, con la infraestructura ya levantada:
+
+```bash
+cd inventory-worker
+dotnet user-secrets init
+dotnet user-secrets set "ConnectionStrings:InventoryDb" "Server=localhost,1433;Database=InventoryDb;User Id=sa;Password=<tu contraseña>;TrustServerCertificate=True;"
+dotnet user-secrets set "RabbitMQ:Host" "localhost"
+dotnet user-secrets set "RabbitMQ:Port" "5672"
+dotnet user-secrets set "RabbitMQ:User" "guest"
+dotnet user-secrets set "RabbitMQ:Password" "guest"
+dotnet run
+```
+
+A diferencia de Orders API, Inventory Worker no expone ningún endpoint —
+es un proceso en segundo plano. Para verificar que está corriendo
+correctamente: crea un pedido desde Orders API (`POST /orders`) y revisa
+en la consola de Inventory Worker que el evento se procesó; o entra al
+panel de RabbitMQ (`http://localhost:15672`) y confirma que el mensaje se
+consumió de `order-created` y apareció uno nuevo en `stock-events`.
 
 **Verificación:** el servicio `db-init` debería terminar con código de
 salida 0 (visible con `docker compose ps`). Conectándote a `localhost:1433`
