@@ -1,0 +1,99 @@
+<div class="max-w-lg mx-auto">
+  <h1 class="text-2xl font-bold mb-4">Crear pedido</h1>
+
+  <form
+    [formGroup]="form"
+    (ngSubmit)="submit()"
+    class="card bg-base-100 shadow-md p-6 flex flex-col gap-5"
+  >
+    @if (apiError()) {
+      <div class="alert alert-error">
+        <span>{{ apiError() }}</span>
+      </div>
+    }
+
+    <div class="flex flex-col gap-1.5">
+      <label class="label" for="customerName">
+        <span class="label-text font-semibold text-base-content">Cliente</span>
+      </label>
+      <input
+        id="customerName"
+        type="text"
+        formControlName="customerName"
+        class="input w-full border-2 border-base-300 rounded-lg px-4 py-2 text-base bg-base-100 focus:border-primary focus:outline-none"
+        [class.border-error]="
+          form.controls.customerName.invalid &&
+          form.controls.customerName.touched
+        "
+      />
+      @if (
+        form.controls.customerName.invalid && form.controls.customerName.touched
+      ) {
+        <span class="text-error text-sm"
+          >El nombre del cliente es obligatorio.</span
+        >
+      }
+    </div>
+
+    <div class="flex flex-col gap-1.5">
+      <label class="label" for="sku">
+        <span class="label-text font-semibold text-base-content">SKU</span>
+      </label>
+      <input
+        id="sku"
+        type="text"
+        formControlName="sku"
+        class="input w-full border-2 border-base-300 rounded-lg px-4 py-2 text-base font-mono bg-base-100 focus:border-primary focus:outline-none"
+        [class.border-error]="
+          form.controls.sku.invalid && form.controls.sku.touched
+        "
+      />
+      @if (form.controls.sku.invalid && form.controls.sku.touched) {
+        <span class="text-error text-sm">El SKU es obligatorio.</span>
+      }
+    </div>
+
+    <div class="flex flex-col gap-1.5">
+      <label class="label" for="quantity">
+        <span class="label-text font-semibold text-base-content">Cantidad</span>
+      </label>
+      <input
+        id="quantity"
+        type="number"
+        min="1"
+        step="1"
+        formControlName="quantity"
+        class="input w-full border-2 border-base-300 rounded-lg px-4 py-2 text-base bg-base-100 focus:border-primary focus:outline-none"
+        [class.border-error]="
+          form.controls.quantity.invalid && form.controls.quantity.touched
+        "
+      />
+      @if (
+        form.controls.quantity.touched &&
+        form.controls.quantity.errors?.["required"]
+      ) {
+        <span class="text-error text-sm">La cantidad es obligatoria.</span>
+      }
+      @if (
+        form.controls.quantity.touched &&
+        (form.controls.quantity.errors?.["min"] ||
+          form.controls.quantity.errors?.["pattern"])
+      ) {
+        <span class="text-error text-sm"
+          >La cantidad debe ser un número entero positivo.</span
+        >
+      }
+    </div>
+
+    <button
+      type="submit"
+      class="btn btn-primary mt-2"
+      [disabled]="submitting()"
+    >
+      @if (submitting()) {
+        <span class="loading loading-spinner loading-sm"></span>
+      }
+      Crear pedido
+    </button>
+  </form>
+</div>

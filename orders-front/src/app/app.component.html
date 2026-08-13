@@ -1,0 +1,20 @@
+<div class="navbar bg-base-100 shadow-sm px-6">
+  <div class="flex-1">
+    <span class="text-xl font-bold text-primary">OrderFlow App</span>
+  </div>
+  <div class="flex gap-2">
+    <a
+      routerLink="/pedidos"
+      routerLinkActive="btn-primary"
+      class="btn btn-ghost"
+      >Pedidos</a
+    >
+    <a routerLink="/crear" routerLinkActive="btn-primary" class="btn btn-ghost"
+      >Crear pedido</a
+    >
+  </div>
+</div>
+
+<main class="p-6">
+  <router-outlet />
+</main>

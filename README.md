@@ -215,6 +215,11 @@ respuestas HTTP: `ArgumentException` se convierte en `400`,
 controlada en `500` — así ningún controller ni handler necesita bloques
 `try/catch` propios.
 
+Orders API también expone CORS habilitado (`Cors:AllowedOrigins` en
+`appsettings.json`) para que el frontend Angular, que corre en un origen
+distinto (`http://localhost:4200` en desarrollo), pueda consumirla sin que
+el navegador bloquee las peticiones.
+
 ## Arquitectura de Inventory Worker
 
 A diferencia de Orders API, Inventory Worker no expone ninguna API — es un
@@ -266,15 +271,74 @@ publica a una sola cola fija (`stock-events`). El mecanismo de
 recuperación ante caídas de RabbitMQ es idéntico al ya descrito en la
 sección de Outbox.
 
-## Requisitos y despliegue
+## Arquitectura del Frontend (`orders-front`)
 
-> Esta sección se irá ampliando cuando se agregue el frontend.
+El frontend es deliberadamente pequeño — dos vistas sobre un único
+recurso (`Order`) — así que la arquitectura sigue el mismo principio de
+proporcionalidad que separó a Inventory Worker de Orders API: nada de
+NgModules, nada de gestión de estado pesada, solo lo que la app
+realmente necesita.
+
+**Organización de carpetas:** `core/` agrupa lo transversal a toda la
+app (el modelo `Order` y el `OrdersService`, que cualquier vista puede
+necesitar), y `features/orders/` contiene las dos vistas
+(`create-order/`, `orders-list/`) como componentes standalone
+independientes. Angular 19 genera componentes standalone por defecto (sin
+`NgModule`), y las dos rutas (`/crear`, `/pedidos`) se cargan de forma
+perezosa con `loadComponent` — no hay un `AppModule` en ningún lado del
+proyecto.
+
+**Por qué signals y no NgRx:** el estado compartido de la app es, en la
+práctica, una sola lista de pedidos y una bandera de carga —
+`OrdersService` los expone como `signal<Order[]>` y `signal<boolean>`.
+Para un estado de este tamaño, NgRx (actions, reducers, effects,
+selectors) es más ceremonia de la que el problema justifica. Los signals
+dan lo que se necesita — estado reactivo que dispara actualizaciones de
+vista automáticamente sin `subscribe()` manual en el componente — con una
+API mínima, y encajan de forma natural con la nueva sintaxis de control
+de flujo de Angular (`@if`/`@for`) que ya usa toda la plantilla.
+
+**Por qué Reactive Forms y no Template-Driven:** el enunciado pide
+"validaciones y manejo de errores visible", y Reactive Forms deja esa
+lógica en la clase del componente (`FormBuilder`, `Validators`) en vez de
+esparcida en directivas dentro del HTML — más fácil de razonar y de
+ligar directamente a mensajes de error por campo (`control.invalid &&
+control.touched`). Un detalle que costó un error de compilación en el
+camino: `FormBuilder.group()` normal infiere cada control como `T | null`
+(porque `reset()` puede volver a `null` por defecto), así que
+`CreateOrderComponent` usa `fb.nonNullable.group(...)` para que los tres
+campos, todos requeridos, queden tipados sin `null`.
+
+**Comunicación con el backend:** `OrdersService` habla con Orders API vía
+`HttpClient`, deserializando directamente al mismo sobre `ApiResponse<T>`
+(`success`, `code`, `message`, `error`, `data`) que ya usa la API. Un
+detalle importante de Angular al integrarlo: las respuestas con código
+fuera del rango 2xx (como el `400` de un SKU inexistente) no llegan por
+el callback `next` del `subscribe`, sino por `error` — aunque el cuerpo
+sí venga en JSON válido y Angular lo parsee igual. `CreateOrderComponent`
+lee `err.error.error` (el mensaje de negocio que arma Orders API) para
+mostrarlo en el formulario.
+
+**Actualización de la lista:** el enunciado permite polling en vez de
+tiempo real, así que `OrdersListComponent` refresca la lista cada 10
+segundos con RxJS (`interval().pipe(startWith(0), takeUntilDestroyed())`)
+en vez de WebSockets/SignalR — cumple el requisito sin la complejidad
+adicional de una conexión persistente para un panel de administración
+interno.
+
+**Estilos:** Tailwind CSS v4 + daisyUI 5, con un tema custom (`q10`)
+definido en `styles.css` que aproxima los colores de marca de Q10 (naranja
+como color primario). Ambas librerías usan configuración "CSS-first" en
+sus versiones actuales — no hay `tailwind.config.js` en el proyecto.
+
+## Requisitos y despliegue
 
 **Requisitos previos:**
 
 - Docker Desktop instalado y corriendo.
 - .NET 9 SDK (para correr Orders API e Inventory Worker en desarrollo
   local).
+- Node.js y Angular CLI 19 (para correr el frontend en desarrollo local).
 
 **Configuración:**
 
@@ -338,6 +402,20 @@ en la consola de Inventory Worker que el evento se procesó; o entra al
 panel de RabbitMQ (`http://localhost:15672`) y confirma que el mensaje se
 consumió de `order-created` y apareció uno nuevo en `stock-events`.
 
+**Corriendo el frontend en desarrollo local:**
+
+Con Orders API corriendo (el frontend le apunta a
+`http://localhost:5108`, configurado en `src/environments/environment.ts`):
+
+```bash
+cd frontend/orders-front
+npm install
+ng serve
+```
+
+Abre `http://localhost:4200` — la vista `/pedidos` carga la lista (con
+polling cada 10 segundos) y `/crear` tiene el formulario de creación.
+
 **Verificación:** el servicio `db-init` debería terminar con código de
 salida 0 (visible con `docker compose ps`). Conectándote a `localhost:1433`
 con cualquier cliente de SQL Server (usuario `sa`, la contraseña de tu
@@ -394,3 +472,10 @@ transiciones de estado.)_
 - **`CreatedAtAction`** en el endpoint de creación en vez de
   `StatusCode(201, ...)`, ahora que `GetOrderById` ya existe, para incluir
   el header `Location` estándar de REST.
+- **Consistencia de `DateTime.Kind`** al serializar fechas en Orders API:
+  `createdAt` sale a veces con sufijo `Z` (UTC explícito) y a veces sin
+  él, según el `Kind` del valor en memoria en cada punto donde se
+  serializa. Se mitigó en el frontend (normalizando el string antes de
+  guardarlo), pero lo correcto es arreglar la causa raíz en el backend —
+  asegurar que todo `DateTime` que se expone en un DTO tenga
+  `Kind = Utc` de forma consistente.

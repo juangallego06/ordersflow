@@ -1,0 +1,49 @@
+<div class="max-w-4xl mx-auto">
+  <h1 class="text-2xl font-bold mb-4">Pedidos</h1>
+
+  @if (ordersService.loading() && sortedOrders().length === 0) {
+    <div class="flex justify-center py-12">
+      <span class="loading loading-spinner loading-lg text-primary"></span>
+    </div>
+  } @else if (sortedOrders().length === 0) {
+    <div class="alert">
+      <span>No hay pedidos todavía.</span>
+    </div>
+  } @else {
+    <div class="card bg-base-100 shadow-md">
+      <div class="overflow-x-auto">
+        <table class="table table-zebra">
+          <thead>
+            <tr class="bg-base-200 text-xs uppercase tracking-wide">
+              <th>Cliente</th>
+              <th>SKU</th>
+              <th class="text-right">Cantidad</th>
+              <th>Estado</th>
+              <th>Creado</th>
+            </tr>
+          </thead>
+          <tbody>
+            @for (order of sortedOrders(); track order.id) {
+              <tr class="hover:bg-base-200/60">
+                <td class="font-medium">{{ order.customerName }}</td>
+                <td class="font-mono text-sm">{{ order.sku }}</td>
+                <td class="text-right">{{ order.quantity }}</td>
+                <td>
+                  <span
+                    class="badge badge-lg w-24 justify-center font-medium"
+                    [class]="statusBadgeClass(order.status)"
+                  >
+                    {{ order.status }}
+                  </span>
+                </td>
+                <td class="text-base-content/70">
+                  {{ order.createdAt | date: "short" }}
+                </td>
+              </tr>
+            }
+          </tbody>
+        </table>
+      </div>
+    </div>
+  }
+</div>
