@@ -1,481 +1,147 @@
-# OrderFlow — Prueba técnica Q10
+# OrderFlow
 
-Sistema de gestión de pedidos con reserva de inventario, construido como un
-conjunto de servicios independientes que se comunican de forma asíncrona.
-Este README se irá completando a medida que avanza la implementación.
+Sistema de gestión de pedidos con reserva de inventario: tres servicios
+independientes (**Orders API**, **Inventory Worker**, **frontend Angular**)
+que se comunican de forma asíncrona vía RabbitMQ, sin compartir base de
+datos.
 
-## Modelo de datos y decisiones de arquitectura
+## Arquitectura
 
-### Separación de bases de datos
+**Dos bases de datos separadas** (`OrdersDb`, `InventoryDb`), una por
+servicio, en el mismo contenedor de SQL Server por simplicidad de
+despliegue pero lógicamente independientes. Ningún servicio consulta las
+tablas del otro directamente — la única comunicación es vía eventos en
+RabbitMQ (`order-created`: Orders→Inventory; `stock-events`:
+Inventory→Orders, con `StockReserved`/`StockRejected` distinguidos por la
+propiedad AMQP `Type`). Esto evita que un cambio de esquema en un
+servicio rompa al otro sin contrato explícito.
 
-El sistema usa dos bases de datos separadas — `OrdersDb` e `InventoryDb` —
-alojadas en el mismo contenedor de SQL Server por simplicidad de despliegue,
-pero lógicamente independientes. Cada servicio es dueño exclusivo de sus
-propios datos: Orders API nunca consulta directamente las tablas de
-Inventory Worker, ni viceversa. La única forma en que un servicio se entera
-de lo que pasó en el otro es a través de eventos publicados en RabbitMQ.
+**Patrón Outbox, simétrico en ambos servicios.** Ningún evento se publica
+directo a RabbitMQ: se escribe en una tabla `OutboxMessages` dentro de la
+misma transacción que el cambio de estado que lo originó, y un
+`BackgroundService` lo publica cada 5s, reintentando solo si falla. Esto
+resuelve el _dual-write problem_ (guardar en BD y publicar a un broker son
+dos operaciones separadas; sin Outbox, una puede fallar mientras la otra
+tiene éxito).
 
-Esta separación es intencional y refleja un principio central de sistemas
-distribuidos: acoplar dos servicios a través de una base de datos compartida
-elimina buena parte del beneficio de tenerlos separados en primer lugar,
-porque un cambio de esquema en un lado puede romper al otro sin que medie
-ningún contrato explícito.
+**Idempotencia con dos mecanismos, cada uno donde corresponde.** Inventory
+Worker (el lado sensible, porque descuenta stock) usa una tabla
+`ProcessedEvents` con `EventId` único, insertada en la misma transacción
+que el descuento — evento duplicado, no se reprocesa. Orders API no
+necesitó tabla adicional: `Order.Confirm()`/`Reject()` ya lanzan excepción
+si el pedido no está en `Pending`, así que un evento duplicado se
+descarta solo (idempotencia "gratis" de una regla de negocio que ya
+existía).
 
-### Esquema y tablas
+**Reserva de stock, atómica sin locks.** `UPDATE Stock SET Available =
+Available - @cantidad WHERE Sku = @sku AND Available >= @cantidad`,
+condición y escritura en una sola sentencia — evita la condición de
+carrera de un `SELECT` de verificación seguido de un `UPDATE` separado.
 
-**`Orders` (OrdersDb):** cada fila representa un pedido con un único `Sku`
-y una única `Quantity`, siguiendo el contrato mínimo definido en el
-enunciado de la prueba. Se evaluó un modelo con múltiples líneas por pedido
-(`Orders` + `OrdersDetail`), pero se descartó por ahora — el detalle de esa
-decisión y cómo se resolvería está en la sección "Qué haría distinto con
-más tiempo".
+**Orders API** sigue Clean Architecture completa (`Domain`, `Application`,
+`Infrastructure`, `Api`) porque orquesta REST + eventos + CQRS-lite (vía
+MediatR, no CQRS puro — mismas tablas para lectura y escritura). `Order` y
+`Product` son entidades con comportamiento (constructores privados,
+`Create()` como único punto de entrada), no DTOs con setters públicos.
+**Inventory Worker** es un solo flujo de trabajo (consumir evento → decidir
+→ responder), así que es un único proyecto con carpetas en vez de 4
+`.csproj` — la misma rigurosidad de Orders API hubiera sido
+desproporcionada para su tamaño. Su `IUnitOfWork` expone
+`Begin/Commit/RollbackAsync` (no solo `SaveChangesAsync` como en Orders
+API) porque su consumidor necesita leer resultados intermedios
+(¿duplicado? ¿alcanzó el stock?) antes de decidir qué publicar, todo
+dentro de una única transacción.
 
-**`Products` (OrdersDb):** cataloga los SKUs válidos del sistema —
-únicamente el campo `Sku`. Existe separada de `Stock` (que vive en
-`InventoryDb` y sí conoce cantidades) por una razón práctica: Orders API
-necesita poder validar si un SKU existe en el momento de crear un pedido,
-con un `400` inmediato si no existe, sin depender de una llamada síncrona a
-Inventory Worker (lo que reintroduciría el acoplamiento que la separación
-de bases de datos busca evitar). La solución fue duplicar intencionalmente
-el catálogo — un dato de referencia casi estático — entre las dos bases,
-mientras que el dato realmente mutable (la cantidad disponible) sigue
-viviendo únicamente en `InventoryDb`. La limitación conocida: si se agrega
-un producto nuevo, hay que sembrarlo en ambas bases; en un sistema real
-esto se resolvería con un servicio de catálogo compartido o sincronización
-por eventos.
+**Frontend Angular 19**, standalone (sin NgModules), dos rutas
+(`/crear`, `/pedidos`). Estado con signals (`OrdersService`) en vez de
+NgRx — una lista y una bandera de carga no justifican esa ceremonia.
+Reactive Forms para validación visible en el formulario. Lista
+refrescada con polling cada 10s (permitido explícitamente por el
+enunciado en vez de WebSockets/SignalR).
 
-**`OutboxMessages` (en ambas bases):** implementa el patrón Outbox. Cada
-vez que un servicio necesita publicar un evento como resultado de un cambio
-de estado, el evento se escribe en esta tabla dentro de la misma transacción
-que el cambio de estado, en vez de publicarse directamente a RabbitMQ en el
-momento. Un proceso en segundo plano (`BackgroundService`) lee
-periódicamente los mensajes pendientes y los publica, marcándolos como
-procesados solo si el envío fue exitoso.
+## Base de datos: SQL Server real, no en memoria
 
-Esto resuelve un problema clásico de sistemas distribuidos conocido como
-"dual-write problem": si guardas un cambio en la base de datos y publicas un
-evento como dos operaciones separadas, existe una ventana en la que la
-primera tiene éxito y la segunda falla (por ejemplo, si el broker está
-caído en ese instante), dejando el sistema en un estado inconsistente del
-que nadie se entera. Con Outbox, el cambio de estado y la intención de
-publicar quedan atómicamente juntos; la publicación en sí se recupera sola
-en cuanto el broker vuelve a estar disponible. Se implementó en ambos
-servicios (Orders API e Inventory Worker) porque el mismo riesgo existe en
-las dos direcciones del flujo, no solo en la que el enunciado menciona
-explícitamente.
+Se eligió SQL Server real corriendo en Docker (no SQLite ni una BD en
+memoria) porque el enunciado pide explícitamente que "el seed funcione y
+los estados persistan mientras el sistema corre" — una BD en memoria se
+reinicia con cada restart del proceso, lo cual habría hecho trivial
+simularlo pero no habría probado nada real sobre concurrencia (el `UPDATE`
+atómico de `Stock` solo tiene sentido con un motor real gestionando
+bloqueos de fila) ni sobre reinicio de servicios sin perder pedidos ya
+creados. El esquema es **database-first**: `BD/init.sql` (idempotente,
+`IF OBJECT_ID(...) IS NULL`) es la única fuente de verdad; EF Core solo
+mapea contra él vía Fluent API, sin migraciones.
 
-**`Stock` (InventoryDb):** guarda la cantidad disponible por SKU. El
-descuento de inventario se hace con una sola sentencia `UPDATE` con la
-condición de stock suficiente en el propio `WHERE`, en vez de un `SELECT`
-de verificación seguido de un `UPDATE`. Esto es importante bajo
-concurrencia: si dos pedidos del mismo SKU llegan casi al mismo tiempo, un
-`SELECT` previo no garantiza que el dato siga vigente para cuando se
-ejecuta el `UPDATE`, lo que podría dejar el stock en negativo. Al poner la
-condición directamente en el `UPDATE`, la validación y la escritura ocurren
-como una sola operación atómica a nivel de motor de base de datos.
+## Trade-offs asumidos
 
-**`ProcessedEvents` (InventoryDb):** sostiene la idempotencia del
-consumidor. Antes de procesar un evento `OrderCreated`, se intenta insertar
-su `EventId` en esta tabla dentro de la misma transacción que el descuento
-de stock; si el insert falla porque el `EventId` ya existe (clave única),
-se trata como un evento duplicado y no se vuelve a descontar. Esto es
-necesario porque RabbitMQ (como la mayoría de brokers de mensajes) garantiza
-entrega _at-least-once_: el mismo mensaje puede llegar más de una vez.
+- **Duplicar el catálogo de SKUs** (`Products` en `OrdersDb`) en vez de
+  que Orders API valide el SKU llamando a Inventory Worker de forma
+  síncrona — evita reintroducir el acoplamiento que la separación de
+  bases de datos busca evitar, a costa de tener que sembrar productos
+  nuevos en dos lugares.
+- **Pedido de una sola línea** (`Sku` + `Quantity`), no multi-línea —
+  cumple el contrato mínimo del enunciado; el diseño para multi-línea
+  con `SAVEPOINT` ya está pensado (ver "Qué haría distinto").
+- **CORS abierto solo a `http://localhost:4200`** en desarrollo, vía
+  config (no secreto, no necesita `user-secrets`).
+- **`ApiResponse<T>`** envuelve todas las respuestas (`success`, `code`,
+  `message`, `error`, `data`) — se aparta un poco del ejemplo literal del
+  enunciado, pero los códigos HTTP reales (`201`/`400`/`404`) siguen
+  siendo los que importan para cualquier validación automática.
 
-### Inicialización automática (`BD/entrypoint.sh`)
+## Cómo correr todo
 
-El esquema de ambas bases de datos se define en `BD/init.sql` y se aplica
-automáticamente al levantar el sistema, sin pasos manuales. A diferencia de
-la imagen oficial de Postgres, la imagen de SQL Server no ejecuta scripts
-de inicialización por sí sola, así que se agregó un servicio adicional
-(`db-init` en el `docker-compose.yml`) cuyo único trabajo es esperar a que
-SQL Server esté listo para aceptar conexiones y luego ejecutar `init.sql`
-con `sqlcmd`.
-
-El script `init.sql` está escrito para ser idempotente (usa
-`IF NOT EXISTS` / `IF OBJECT_ID IS NULL` en cada creación y en el seed), de
-forma que `docker compose up` se pueda ejecutar cualquier cantidad de veces
-sin fallar ni duplicar datos.
-
-El esquema se maneja como **database-first**: `init.sql` es la única fuente
-de verdad de la estructura de las tablas. Entity Framework Core se usa
-únicamente para consultar y mapear esas tablas (vía Fluent API), pero nunca
-para generar ni aplicar migraciones — así se evita tener dos fuentes de
-verdad del esquema compitiendo entre sí.
-
-## Arquitectura de Orders API
-
-Orders API es el servicio más complejo del sistema — expone la API REST,
-orquesta la creación de pedidos, y coordina tanto la publicación como el
-consumo de eventos. Por eso se construyó siguiendo Clean Architecture
-completa, separada en cuatro proyectos (`OrdersApi.Domain`,
-`OrdersApi.Application`, `OrdersApi.Infrastructure`, `OrdersApi.Api`), cada
-uno dependiendo solo de los que están más adentro. Inventory Worker, en
-cambio, es un único flujo de trabajo (consumir un evento, decidir,
-responder), así que se decidió construirlo como un solo proyecto con las
-mismas responsabilidades organizadas en carpetas en vez de proyectos
-separados — aplicar la misma rigurosidad a un servicio tan delgado hubiera
-sido desproporcionado.
-
-### Entidades con comportamiento, no bolsas de datos
-
-`Order` y `Product` (en `Domain`) no son simples DTOs con getters y setters
-públicos. Ambas tienen constructores privados, setters privados, y un
-método estático `Create(...)` como único punto de entrada — así es
-imposible construir un pedido con una cantidad fuera de rango o un nombre
-de cliente vacío en cualquier parte del código, porque la validación vive
-dentro de la propia entidad, no repartida en cada lugar que la use. `Order`
-además expone `Confirm()` y `Reject()` en vez de dejar que cualquier capa
-le cambie el estado directamente — esos métodos verifican que el pedido
-esté en `Pending` antes de permitir la transición, protegiendo la máquina
-de estados del negocio.
-
-### Casos de uso como Commands y Queries (CQRS-lite)
-
-La capa `Application` organiza cada caso de uso como una clase de Command o
-Query independiente, despachada a través de un mediator (MediatR), en vez
-de un único servicio con varios métodos. Es importante ser precisos con el
-nombre: esto **no es CQRS puro** — no hay modelos ni almacenamiento
-separados para lectura y escritura, ambos caminos usan las mismas tablas.
-Es, más bien, el patrón mediator aplicado para que cada caso de uso sea una
-clase pequeña con una sola responsabilidad, en vez de una interfaz
-`IOrderService` con varios métodos no relacionados entre sí.
-`CreateOrderCommand`/`CreateOrderCommandHandler` maneja la creación;
-`GetOrdersQuery` y `GetOrderByIdQuery` manejan las dos formas de consulta.
-
-### Repositorio + Unit of Work: un solo guardado atómico
-
-Los repositorios (`IOrderRepository`, `IOutboxRepository`,
-`IProductRepository`) solo agregan o consultan entidades — ninguno llama a
-`SaveChanges` internamente. El guardado real ocurre una única vez, al final
-de cada caso de uso, a través de `IUnitOfWork.SaveChangesAsync()`. La razón
-es que `CreateOrderCommandHandler` necesita que el pedido nuevo y el
-mensaje del Outbox se guarden **juntos o no se guarde ninguno** — como
-ambos quedan rastreados por la misma instancia de `DbContext`, una sola
-llamada a `SaveChangesAsync()` los envuelve automáticamente en una
-transacción atómica, sin necesitar manejar transacciones explícitas a mano.
-
-### El patrón Outbox en la práctica
-
-Cuando `CreateOrderCommandHandler` crea un pedido, no publica el evento
-`OrderCreated` directamente a RabbitMQ — lo escribe como una fila en
-`OutboxMessages`, en la misma transacción que el pedido. Un servicio
-independiente, `OutboxPublisherBackgroundService`, revisa esa tabla cada 5
-segundos, publica lo que encuentra pendiente, y solo lo marca como
-procesado si la publicación tuvo éxito. Si RabbitMQ está caído en ese
-momento, la publicación simplemente se reintenta en la siguiente vuelta del
-loop — el pedido ya quedó guardado de forma segura, y el evento se
-recupera solo en cuanto el broker vuelve a estar disponible. Este mismo
-servicio corre en Orders API para publicar `OrderCreated`, y una versión
-equivalente corre en Inventory Worker para publicar
-`StockReserved`/`StockRejected` (ver "Arquitectura de Inventory Worker").
-
-### Topología de RabbitMQ
-
-Se usan dos colas, una por cada dirección del flujo, no una por cada tipo
-de evento específico: `order-created` (Orders API publica, Inventory
-Worker consume) y `stock-events` (Inventory Worker publica ahí tanto
-`StockReserved` como `StockRejected`). Dentro de `stock-events`, los dos
-tipos de evento se distinguen usando la propiedad estándar de AMQP `Type`
-del mensaje — no hace falta abrir el JSON para saber cuál es cuál, ni
-mantener dos colas para algo que conceptualmente es "la respuesta a mi
-pedido". Se usa el exchange por defecto de RabbitMQ, sin necesidad de
-declarar exchanges personalizados, dado el tamaño del problema.
-
-### Idempotencia: dos mecanismos, cada uno donde corresponde
-
-El sistema resuelve la idempotencia de dos formas distintas, según el lado
-del flujo:
-
-- **Del lado de Inventory Worker** (procesar `OrderCreated`, la operación
-  más sensible porque descuenta stock): una tabla dedicada
-  `ProcessedEvents`, con el `EventId` como clave única, insertado en la
-  misma transacción que el descuento. Necesaria porque ahí sí importa
-  evitar cualquier posibilidad de doble descuento.
-- **Del lado de Orders API** (procesar `StockReserved`/`StockRejected`): no
-  se construyó una tabla adicional. La propia máquina de estados de
-  `Order` ya lo resuelve — `Confirm()`/`Reject()` lanzan una excepción si
-  el pedido ya no está en `Pending`, así que un evento duplicado
-  simplemente se descarta de forma segura (se hace `ack` sin reprocesar).
-  Es una idempotencia "gratis", derivada de una regla de negocio que ya
-  existía por otra razón.
-
-### Sobre de respuesta uniforme y manejo centralizado de errores
-
-Todas las respuestas de la API se envuelven en `ApiResponse<T>` (`success`,
-`code`, `message`, `error`, `data`), aplicado únicamente en la capa `Api`
-— los DTOs de `Application` no saben nada de este formato. Esto se aparta
-levemente del ejemplo literal del enunciado (que muestra el pedido
-directamente en el cuerpo de la respuesta, no envuelto), aunque los
-códigos HTTP reales (`201`, `400`, `404`, etc.) siguen siendo los que
-importan para cualquier validación automática. Un
-`ExceptionHandlingMiddleware` centraliza la traducción de excepciones a
-respuestas HTTP: `ArgumentException` se convierte en `400`,
-`InvalidOperationException` en `409`, cualquier otra excepción no
-controlada en `500` — así ningún controller ni handler necesita bloques
-`try/catch` propios.
-
-Orders API también expone CORS habilitado (`Cors:AllowedOrigins` en
-`appsettings.json`) para que el frontend Angular, que corre en un origen
-distinto (`http://localhost:4200` en desarrollo), pueda consumirla sin que
-el navegador bloquee las peticiones.
-
-## Arquitectura de Inventory Worker
-
-A diferencia de Orders API, Inventory Worker no expone ninguna API — es un
-proceso que solo reacciona a un evento y responde con otro. Por eso se
-construyó como un único proyecto (`InventoryWorker`), organizado en las
-mismas capas conceptuales que Orders API (`Domain`, `Application`,
-`Infrastructure`) pero como carpetas dentro de un solo `.csproj`, no como
-proyectos separados (ver justificación en "Arquitectura de Orders API").
-
-### El flujo de `order-created`, paso a paso
-
-`OrderCreatedConsumerBackgroundService` consume la cola `order-created` con
-ack manual (`autoAck: false`), y por cada mensaje ejecuta tres pasos dentro
-de una única transacción explícita:
-
-1. **Idempotencia primero:** `IProcessedEventRepository.TryMarkAsProcessedAsync(eventId)` intenta insertar el `EventId` del evento en `ProcessedEvents`. Si ya existía (evento duplicado), no se hace nada más — se revierte la transacción y se hace `ack` del mensaje sin reprocesar.
-2. **Reserva de stock:** si es la primera vez que se ve el evento, `IStockRepository.TryReserveAsync(sku, cantidad)` ejecuta el `UPDATE` condicional descrito en la sección de `Stock` y devuelve si alcanzó el stock o no.
-3. **Outbox:** con ese resultado ya se sabe qué publicar — se arma un `OutboxMessage` con `EventType = "StockReserved"` o `"StockRejected"` y el mismo shape de datos del evento original más un `eventId` nuevo (es un evento distinto, aunque esté correlacionado por `orderId`), guardado vía `IOutboxRepository.AddAsync`.
-
-Solo si los tres pasos terminan bien se hace `CommitAsync()` de la
-transacción; cualquier excepción no controlada dispara `RollbackAsync()` y
-el mensaje se reintenta con `nack(requeue: true)`.
-
-### Por qué `IUnitOfWork` no es igual en los dos servicios
-
-Esto es una decisión intencional, no una inconsistencia entre servicios. En
-Orders API, `IUnitOfWork` es solo un envoltorio de `SaveChangesAsync()`:
-el caso de uso decide todo antes de tocar la base (crear el pedido, armar
-el mensaje del Outbox) y confirma una sola vez al final — no hay ninguna
-rama de código cuya decisión dependa de un resultado que solo la base de
-datos puede dar.
-
-En Inventory Worker sí existe esa dependencia: si el stock alcanza o no
-determina literalmente qué evento se publica. Por eso ahí `IUnitOfWork`
-expone `BeginTransactionAsync()`/`CommitAsync()`/`RollbackAsync()` en vez
-de un solo método — permite ejecutar cada paso, leer su resultado
-inmediato (filas afectadas, excepción de clave duplicada) y decidir el
-siguiente paso, todo sin que nada quede confirmado de forma permanente
-hasta el final. SQL Server lo permite de forma nativa: los `UPDATE`/
-`INSERT` intermedios son visibles para la aplicación en cuanto se
-ejecutan, aunque la transacción que los contiene siga abierta.
-
-### Publicación simétrica
-
-`OutboxPublisherBackgroundService` en Inventory Worker es la contraparte
-exacta del que corre en Orders API: revisa `OutboxMessages` cada 5
-segundos y publica lo pendiente, con la diferencia de que aquí siempre
-publica a una sola cola fija (`stock-events`). El mecanismo de
-recuperación ante caídas de RabbitMQ es idéntico al ya descrito en la
-sección de Outbox.
-
-## Arquitectura del Frontend (`orders-front`)
-
-El frontend es deliberadamente pequeño — dos vistas sobre un único
-recurso (`Order`) — así que la arquitectura sigue el mismo principio de
-proporcionalidad que separó a Inventory Worker de Orders API: nada de
-NgModules, nada de gestión de estado pesada, solo lo que la app
-realmente necesita.
-
-**Organización de carpetas:** `core/` agrupa lo transversal a toda la
-app (el modelo `Order` y el `OrdersService`, que cualquier vista puede
-necesitar), y `features/orders/` contiene las dos vistas
-(`create-order/`, `orders-list/`) como componentes standalone
-independientes. Angular 19 genera componentes standalone por defecto (sin
-`NgModule`), y las dos rutas (`/crear`, `/pedidos`) se cargan de forma
-perezosa con `loadComponent` — no hay un `AppModule` en ningún lado del
-proyecto.
-
-**Por qué signals y no NgRx:** el estado compartido de la app es, en la
-práctica, una sola lista de pedidos y una bandera de carga —
-`OrdersService` los expone como `signal<Order[]>` y `signal<boolean>`.
-Para un estado de este tamaño, NgRx (actions, reducers, effects,
-selectors) es más ceremonia de la que el problema justifica. Los signals
-dan lo que se necesita — estado reactivo que dispara actualizaciones de
-vista automáticamente sin `subscribe()` manual en el componente — con una
-API mínima, y encajan de forma natural con la nueva sintaxis de control
-de flujo de Angular (`@if`/`@for`) que ya usa toda la plantilla.
-
-**Por qué Reactive Forms y no Template-Driven:** el enunciado pide
-"validaciones y manejo de errores visible", y Reactive Forms deja esa
-lógica en la clase del componente (`FormBuilder`, `Validators`) en vez de
-esparcida en directivas dentro del HTML — más fácil de razonar y de
-ligar directamente a mensajes de error por campo (`control.invalid &&
-control.touched`). Un detalle que costó un error de compilación en el
-camino: `FormBuilder.group()` normal infiere cada control como `T | null`
-(porque `reset()` puede volver a `null` por defecto), así que
-`CreateOrderComponent` usa `fb.nonNullable.group(...)` para que los tres
-campos, todos requeridos, queden tipados sin `null`.
-
-**Comunicación con el backend:** `OrdersService` habla con Orders API vía
-`HttpClient`, deserializando directamente al mismo sobre `ApiResponse<T>`
-(`success`, `code`, `message`, `error`, `data`) que ya usa la API. Un
-detalle importante de Angular al integrarlo: las respuestas con código
-fuera del rango 2xx (como el `400` de un SKU inexistente) no llegan por
-el callback `next` del `subscribe`, sino por `error` — aunque el cuerpo
-sí venga en JSON válido y Angular lo parsee igual. `CreateOrderComponent`
-lee `err.error.error` (el mensaje de negocio que arma Orders API) para
-mostrarlo en el formulario.
-
-**Actualización de la lista:** el enunciado permite polling en vez de
-tiempo real, así que `OrdersListComponent` refresca la lista cada 10
-segundos con RxJS (`interval().pipe(startWith(0), takeUntilDestroyed())`)
-en vez de WebSockets/SignalR — cumple el requisito sin la complejidad
-adicional de una conexión persistente para un panel de administración
-interno.
-
-**Estilos:** Tailwind CSS v4 + daisyUI 5, con un tema custom (`q10`)
-definido en `styles.css` que aproxima los colores de marca de Q10 (naranja
-como color primario). Ambas librerías usan configuración "CSS-first" en
-sus versiones actuales — no hay `tailwind.config.js` en el proyecto.
-
-## Requisitos y despliegue
-
-**Requisitos previos:**
-
-- Docker Desktop instalado y corriendo.
-- .NET 9 SDK (para correr Orders API e Inventory Worker en desarrollo
-  local).
-- Node.js y Angular CLI 19 (para correr el frontend en desarrollo local).
-
-**Configuración:**
-
-1. Copia `.env.example` a `.env`.
-2. Completa `MSSQL_SA_PASSWORD` con una contraseña que cumpla los
-   requisitos de complejidad de SQL Server (mínimo 8 caracteres, al menos
-   3 de estas 4 categorías: mayúsculas, minúsculas, números, símbolos).
-
-**Levantar la infraestructura actual:**
+**Requisitos:** Docker Desktop, .NET 9 SDK, Node.js + Angular CLI 19 (los
+dos últimos solo si quieres correr algo fuera de Docker).
 
 ```bash
-docker compose up sqlserver db-init rabbitmq
+cp .env.example .env
+# completa MSSQL_SA_PASSWORD en .env (mín. 8 caracteres, 3 de 4: mayúsculas/minúsculas/números/símbolos)
+
+docker compose up
 ```
 
-Esto levanta SQL Server, aplica el esquema y el seed de forma automática, y
-levanta RabbitMQ con su panel de administración disponible en
-`http://localhost:15672` (usuario/clave por defecto: `guest`/`guest`).
+Esto levanta SQL Server (con el esquema y seed de `BD/init.sql` aplicados
+automáticamente), RabbitMQ, Orders API, Inventory Worker y el frontend.
+Abre **`http://localhost:4200`** — no hace falta ningún paso manual más.
+RabbitMQ queda disponible en `http://localhost:15672` (`guest`/`guest`)
+para ver las colas `order-created`/`stock-events` en vivo.
 
-**Corriendo Orders API en desarrollo local:**
+## SKUs disponibles tras el seed
 
-Con la infraestructura levantada, Orders API se puede correr directamente
-con `dotnet run`, sin necesidad de contenedor propio todavía. Las
-credenciales de desarrollo se configuran con
-[User Secrets](https://learn.microsoft.com/aspnet/core/security/app-secrets)
-(nunca en archivos versionados):
+`BD/init.sql` siembra automáticamente 3 productos con stock inicial en
+`InventoryDb`, listos para probar sin pasos manuales:
+
+| SKU      | Stock inicial |
+| -------- | ------------- |
+| `ABC-01` | 100           |
+| `ABC-02` | 50            |
+| `ABC-03` | 25            |
+
+Para ver el pedido pasar a `Confirmed`, pide una cantidad menor o igual al
+stock disponible. Para ver el caso `Rejected`, pide más — por ejemplo
+26 unidades de `ABC-03`.
+
+**Tests**, un comando por stack:
 
 ```bash
-cd orders-api/OrdersApi.Api
-dotnet user-secrets init
-dotnet user-secrets set "ConnectionStrings:OrdersDb" "Server=localhost,1433;Database=OrdersDb;User Id=sa;Password=<tu contraseña>;TrustServerCertificate=True;"
-dotnet user-secrets set "RabbitMQ:Host" "localhost"
-dotnet user-secrets set "RabbitMQ:Port" "5672"
-dotnet user-secrets set "RabbitMQ:User" "guest"
-dotnet user-secrets set "RabbitMQ:Password" "guest"
-dotnet run
+cd orders-api && dotnet test          # 7 tests (xUnit + Moq): validación, transición de estado, idempotencia
+cd frontend/orders-front && ng test   # 2 tests (Jasmine/Karma): servicio y validación de formulario
 ```
-
-El navegador abre automáticamente en `/swagger`, desde donde se pueden
-probar los tres endpoints (`POST /orders`, `GET /orders`,
-`GET /orders/{id}`).
-
-**Corriendo Inventory Worker en desarrollo local:**
-
-Igual que Orders API, con la infraestructura ya levantada:
-
-```bash
-cd inventory-worker
-dotnet user-secrets init
-dotnet user-secrets set "ConnectionStrings:InventoryDb" "Server=localhost,1433;Database=InventoryDb;User Id=sa;Password=<tu contraseña>;TrustServerCertificate=True;"
-dotnet user-secrets set "RabbitMQ:Host" "localhost"
-dotnet user-secrets set "RabbitMQ:Port" "5672"
-dotnet user-secrets set "RabbitMQ:User" "guest"
-dotnet user-secrets set "RabbitMQ:Password" "guest"
-dotnet run
-```
-
-A diferencia de Orders API, Inventory Worker no expone ningún endpoint —
-es un proceso en segundo plano. Para verificar que está corriendo
-correctamente: crea un pedido desde Orders API (`POST /orders`) y revisa
-en la consola de Inventory Worker que el evento se procesó; o entra al
-panel de RabbitMQ (`http://localhost:15672`) y confirma que el mensaje se
-consumió de `order-created` y apareció uno nuevo en `stock-events`.
-
-**Corriendo el frontend en desarrollo local:**
-
-Con Orders API corriendo (el frontend le apunta a
-`http://localhost:5108`, configurado en `src/environments/environment.ts`):
-
-```bash
-cd frontend/orders-front
-npm install
-ng serve
-```
-
-Abre `http://localhost:4200` — la vista `/pedidos` carga la lista (con
-polling cada 10 segundos) y `/crear` tiene el formulario de creación.
-
-**Verificación:** el servicio `db-init` debería terminar con código de
-salida 0 (visible con `docker compose ps`). Conectándote a `localhost:1433`
-con cualquier cliente de SQL Server (usuario `sa`, la contraseña de tu
-`.env`), deberías ver `OrdersDb` con las tablas `Orders`, `Products` y
-`OutboxMessages`, e `InventoryDb` con `Stock` (con 3 productos sembrados),
-`ProcessedEvents` y `OutboxMessages`.
-
-## Manejo de fallos
-
-**Si Inventory Worker no responde o está caído:** el pedido queda visible
-en el panel con estado `Pending` de forma indefinida — Orders API no
-depende de que Inventory Worker esté disponible para aceptar y persistir
-un pedido nuevo, precisamente porque los dos servicios están desacoplados
-vía eventos. Mejora futura, no implementada: un timeout que marque el
-pedido para revisión manual o dispare una alerta si lleva demasiado tiempo
-en `Pending`.
-
-**Si RabbitMQ está caído cuando un servicio intenta publicar un evento:**
-este es el problema conocido como "dual-write problem" (ver sección de
-Outbox arriba). Se resuelve con el patrón Outbox, implementado
-simétricamente en ambos servicios: el evento queda guardado en la base de
-datos en la misma transacción que el cambio de estado que lo originó, y un
-`BackgroundService` reintenta publicarlo automáticamente cada 5 segundos
-hasta que RabbitMQ vuelva a estar disponible. No se pierde ningún evento ni
-se requiere intervención manual.
-
-**Si el mismo evento se entrega más de una vez** (RabbitMQ garantiza
-_at-least-once delivery_, no _exactly-once_): cada consumidor lo maneja de
-forma idempotente, con un mecanismo distinto según el riesgo real de cada
-lado (ver sección de Idempotencia arriba).
-
-## Tests
-
-_(pendiente — se documentará cuando se escriban. Candidatos claros dado el
-diseño: `Order.Create()` y `Order.Confirm()`/`Reject()` son unitarios
-puros, sin dependencia de base de datos, ideales para cubrir validación y
-transiciones de estado.)_
 
 ## Qué haría distinto con más tiempo
 
-- **Modelo de pedido multi-línea:** se evaluó un diseño con varias líneas
-  por pedido (`Orders` + `OrdersDetail`) en vez del `Sku`+`Quantity` único
-  que exige el contrato mínimo. Se descartó por proporcionalidad, pero el
-  diseño para resolverlo correctamente ya está pensado: descuento de cada
-  línea con `UPDATE` atómico condicional, y si alguna línea falla,
-  revertir solo las líneas ya descontadas con un `SAVEPOINT`
-  (`SAVE TRANSACTION`) dentro de la misma transacción — conservando el
-  registro en `ProcessedEvents` (insertado antes del savepoint) para que
-  la idempotencia no se pierda aunque el pedido termine rechazado.
+- **Pedido multi-línea:** descuento por línea con `UPDATE` atómico
+  condicional; si una línea falla, revertir solo las ya descontadas con
+  un `SAVEPOINT` dentro de la misma transacción, conservando el registro
+  de idempotencia insertado antes del savepoint.
 - **Timeout/alerta para pedidos atascados en `Pending`** si Inventory
   Worker está caído por un período prolongado.
-- **Sincronización de catálogo** entre `OrdersDb.Products` e
-  `InventoryDb.Stock` vía eventos, en vez de seeds duplicados manualmente.
-- **`CreatedAtAction`** en el endpoint de creación en vez de
-  `StatusCode(201, ...)`, ahora que `GetOrderById` ya existe, para incluir
-  el header `Location` estándar de REST.
-- **Consistencia de `DateTime.Kind`** al serializar fechas en Orders API:
-  `createdAt` sale a veces con sufijo `Z` (UTC explícito) y a veces sin
-  él, según el `Kind` del valor en memoria en cada punto donde se
-  serializa. Se mitigó en el frontend (normalizando el string antes de
-  guardarlo), pero lo correcto es arreglar la causa raíz en el backend —
-  asegurar que todo `DateTime` que se expone en un DTO tenga
-  `Kind = Utc` de forma consistente.
+- **Sincronización de catálogo** entre `Products` y `Stock` vía eventos,
+  en vez de seeds duplicados manualmente.
+- **Consistencia de `DateTime.Kind`** al serializar fechas en Orders
+  API — `createdAt` sale a veces con `Z` (UTC explícito) y a veces sin
+  él. Se mitigó en el frontend (normalizando el string), pero lo
+  correcto es forzar `Kind = Utc` de forma consistente en el backend.
+- **`CreatedAtAction`** en vez de `StatusCode(201, ...)` en el endpoint
+  de creación, para incluir el header `Location` estándar de REST.
