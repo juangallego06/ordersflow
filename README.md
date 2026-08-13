@@ -101,6 +101,12 @@ cp .env.example .env
 docker compose up
 ```
 
+> **Nota:** si `docker compose up` falla en el build de `orders-api` o
+> `inventory-worker` con un error `NU1301` / `SSL... UntrustedRoot` durante
+> `dotnet restore`, es un antivirus con inspección de conexiones cifradas
+> (Kaspersky, ESET, etc.) interceptando el tráfico HTTPS del contenedor —
+> desactiva temporalmente esa opción y reintenta.
+
 Esto levanta SQL Server (con el esquema y seed de `BD/init.sql` aplicados
 automáticamente), RabbitMQ, Orders API, Inventory Worker y el frontend.
 Abre **`http://localhost:4200`** — no hace falta ningún paso manual más.
@@ -122,11 +128,17 @@ Para ver el pedido pasar a `Confirmed`, pide una cantidad menor o igual al
 stock disponible. Para ver el caso `Rejected`, pide más — por ejemplo
 26 unidades de `ABC-03`.
 
-**Tests**, un comando por stack:
+**Tests**:
 
 ```bash
-cd orders-api && dotnet test          # 7 tests (xUnit + Moq): validación, transición de estado, idempotencia
-cd frontend/orders-front && ng test   # 2 tests (Jasmine/Karma): servicio y validación de formulario
+API:
+1. cd orders-api
+2. dotnet test          # 7 tests (xUnit + Moq): validación, transición de estado, idempotencia
+
+Front
+1. cd orders-front
+2. npm install
+3. ng test   # 2 tests (Jasmine/Karma): servicio y validación de formulario
 ```
 
 ## Qué haría distinto con más tiempo
