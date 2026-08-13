@@ -125,8 +125,14 @@ stock disponible. Para ver el caso `Rejected`, pide más — por ejemplo
 **Tests**, un comando por stack:
 
 ```bash
-cd orders-api && dotnet test          # 7 tests (xUnit + Moq): validación, transición de estado, idempotencia
-cd orders-front && npm install && ng test   # 2 tests (Jasmine/Karma): servicio y validación de formulario
+API:
+1. cd orders-api
+2. dotnet test          # 7 tests (xUnit + Moq): validación, transición de estado, idempotencia
+
+Front
+1. cd orders-front
+2. npm install
+3. ng test   # 2 tests (Jasmine/Karma): servicio y validación de formulario
 ```
 
 ## Qué haría distinto con más tiempo
