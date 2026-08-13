@@ -126,7 +126,7 @@ stock disponible. Para ver el caso `Rejected`, pide más — por ejemplo
 
 ```bash
 cd orders-api && dotnet test          # 7 tests (xUnit + Moq): validación, transición de estado, idempotencia
-cd frontend/orders-front && ng test   # 2 tests (Jasmine/Karma): servicio y validación de formulario
+cd orders-front && npm install && ng test   # 2 tests (Jasmine/Karma): servicio y validación de formulario
 ```
 
 ## Qué haría distinto con más tiempo
